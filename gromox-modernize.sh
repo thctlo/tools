@@ -8,12 +8,23 @@
 #   ./gromox-modernize.sh apply
 #   ./gromox-modernize.sh status
 #   ./gromox-modernize.sh revert
-#   ./gromox-modernize.sh revert /var/backups/gromox-modernize.DATE
+#   ./gromox-modernize.sh revert /root/backups/<run-timestamp>
 
 set -Eeuo pipefail
 
 DIR="/etc/gromox"
-BACKUP_ROOT="/var/backups"
+
+# Same convention as the server-setup.sh framework's own backup_file()
+# (functions/00-common.sh there): one timestamped run directory under
+# /root/backups/, each backed-up file keeping its full original path
+# underneath it, a manifest listing what was touched. Reimplemented
+# here rather than sourced from that repo on purpose - this tool is
+# meant to stand on its own (a separate repo from the provisioning
+# framework), not depend on it being checked out at some known path.
+RUN_TIMESTAMP="${RUN_TIMESTAMP:-$(date +%Y%m%d-%H%M%S)}"
+BACKUP_ROOT="${BACKUP_ROOT:-/root/backups/${RUN_TIMESTAMP}}"
+MANIFEST_FILE="${BACKUP_ROOT}/modified-files.txt"
+
 SERVICES=(
     gromox-http
     gromox-imap
@@ -61,47 +72,85 @@ restart_services() {
     return "$failed"
 }
 
-backup_config() {
-    local backup="$1"
-    mkdir -m 700 -p "$backup"
-
-    for file in "${FILES[@]}"; do
-        if [[ -f "$DIR/$file" ]]; then
-            cp -a "$DIR/$file" "$backup/$file"
-        fi
-    done
-
-    printf '%s\n' "${FILES[@]}" > "$backup/files.list"
-    chmod 600 "$backup/files.list"
-
-    log "Backup created: $backup"
+# backup_file <absolute path> - ported verbatim from functions/00-common.sh
+# in the server-setup.sh repo (see note above RUN_TIMESTAMP). Not
+# idempotent across repeated touches of the same file WITHIN one run on
+# purpose: the first backup is the true pre-run original; a later touch
+# in the same run appends .1, .2, .3... instead of overwriting it.
+backup_file()
+{
+    local target="$1"
+    [[ -e "$target" ]] || return 0
+    local dest="${BACKUP_ROOT}${target}"
+    mkdir -p "$(dirname "$dest")"
+    if [[ -e "$dest" ]]; then
+        local n=1
+        while [[ -e "${dest}.${n}" ]]; do
+            n=$((n + 1))
+        done
+        dest="${dest}.${n}"
+    fi
+    cp -a "$target" "$dest"
+    mkdir -p "$(dirname "$MANIFEST_FILE")"
+    printf '%-40s %-50s %s\n' "$(basename "$0")" "$target" "$dest" >> "$MANIFEST_FILE"
 }
 
+print_backup_manifest()
+{
+    echo
+    echo "------------------------------------------------------------"
+    echo "Files modified this run"
+    echo "------------------------------------------------------------"
+    if [[ -s "$MANIFEST_FILE" ]]; then
+        column -t "$MANIFEST_FILE" 2>/dev/null || cat "$MANIFEST_FILE"
+        echo
+        echo "Originals backed up under: $BACKUP_ROOT"
+        echo "This list: $MANIFEST_FILE"
+    else
+        echo "(none yet)"
+    fi
+    echo
+}
+
+backup_all_files() {
+    for file in "${FILES[@]}"; do
+        if [[ -f "$DIR/$file" ]]; then
+            backup_file "$DIR/$file"
+        fi
+    done
+    log "Backups (if any files existed) written under: $BACKUP_ROOT"
+}
+
+# restore_config <backup-run-directory>
+#
+# Restores every tracked file found under <backup-run-directory>'s own
+# mirrored path (<backup>/etc/gromox/<file>) back to $DIR. Unlike
+# backup_file's own numbered-suffix files (.1, .2, ...), which only
+# matter if the SAME run touched a file more than once (this tool
+# never does), the plain (no-suffix) copy is always the correct one to
+# restore - the true state from before that run started.
 restore_config() {
     local backup="$1"
     local file
 
-    [[ -f "$backup/files.list" ]] ||
-        die "Invalid backup: $backup"
+    [[ -d "$backup$DIR" ]] ||
+        die "Invalid backup: $backup$DIR not found."
 
-    while IFS= read -r file; do
-        if [[ -f "$backup/$file" ]]; then
-            cp -a "$backup/$file" "$DIR/$file"
+    for file in "${FILES[@]}"; do
+        if [[ -f "$backup$DIR/$file" ]]; then
+            cp -a "$backup$DIR/$file" "$DIR/$file"
         else
             rm -f "$DIR/$file"
         fi
-    done < "$backup/files.list"
+    done
 
-    log "Original configuration restored."
+    log "Original configuration restored from $backup."
 }
 
 apply_config() {
-    local backup
     local changed
 
-    backup="$BACKUP_ROOT/gromox-modernize.$(date +%Y%m%d-%H%M%S)"
-
-    backup_config "$backup"
+    backup_all_files
 
     log "Inspecting and migrating legacy directives..."
 
@@ -122,7 +171,6 @@ rules = {
         "listen_ssl_port": "http_listen_tls",
         "http_listen_port": "http_listen",
         "http_listen_tls_port": "http_listen_tls",
-        "http_support_ssl": "http_support_tls",
     },
     "imap.cfg": {
         "imap_listen_port": "imap_listen",
@@ -135,6 +183,23 @@ rules = {
     "smtp.cfg": {
         "lda_listen_port": "lda_listen",
         "lda_listen_tls_port": "lda_listen_tls",
+    },
+}
+
+# Directives that rename IN PLACE within the same file - NOT moved to
+# gromox.cfg like the listen_* keys above. Confirmed via http.8gx's own
+# man page section headers: "Configuration directives (gromox.cfg)" vs
+# "Configuration directives (http.cfg)" are two distinct, separately
+# documented lists, and http_support_tls is only ever documented under
+# the http.cfg one. An earlier version of this script wrongly moved it
+# to gromox.cfg, same as the listen_* keys - gromox-http's own code
+# only ever reads http_support_tls from http.cfg, so it then found
+# nothing there (NULL), which parse_bool() treats as false, silently
+# deactivating TLS ("TLS support deactivated via config") regardless
+# of the stray "http_support_tls=true" left behind in gromox.cfg.
+rename_in_place = {
+    "http.cfg": {
+        "http_support_ssl": "http_support_tls",
     },
 }
 
@@ -178,6 +243,7 @@ if "gromox.cfg" not in contents:
 
 target = contents["gromox.cfg"][:]
 remove_indices = {}
+appended_lines = {}
 migrations = []
 
 # Check all source directives and conflicts before writing anything.
@@ -227,6 +293,83 @@ for filename, mapping in rules.items():
         remove_indices[filename].add(index)
         migrations.append(f"{filename}: {old} -> {new}={value}")
 
+# Same-file renames (see rename_in_place above) - the old key's line is
+# removed and the new key is appended to the SAME file, never moved to
+# gromox.cfg (mirrors the move-based loop above, just targeting the
+# original file as its own "target" instead of gromox.cfg - this is
+# deliberately not a direct in-place line rewrite: that would mutate
+# contents[filename] as a side effect before the final "did this file
+# actually change" comparison runs, silently defeating it).
+#
+# Also self-heals a server that already ran an earlier, buggy version
+# of this script that WRONGLY moved one of these keys into gromox.cfg
+# (exactly what happened to http_support_tls before this fix): if the
+# new key is found there instead of in its proper file, it is pulled
+# back out of gromox.cfg's target and placed into the proper file
+# where gromox's own code actually reads it from.
+
+for filename, mapping in rename_in_place.items():
+    if filename not in contents:
+        continue
+
+    source = contents[filename]
+    remove_indices.setdefault(filename, set())
+    appended_lines.setdefault(filename, [])
+
+    for old, new in mapping.items():
+        matches = find_keys(source, old)
+
+        if len(matches) > 1:
+            raise SystemExit(f"Duplicate directive {old} in {filename}")
+
+        existing_new = find_keys(source, new)
+        if len(existing_new) > 1:
+            raise SystemExit(f"Duplicate directive {new} in {filename}")
+
+        stray_in_gromox = find_keys(target, new)
+        if len(stray_in_gromox) > 1:
+            raise SystemExit(f"Duplicate directive {new} in gromox.cfg")
+
+        if existing_new:
+            # Already correct in this file. A stray leftover copy in
+            # gromox.cfg (from the old buggy migration) is cleaned up
+            # regardless of whether the old key is still present here.
+            if stray_in_gromox:
+                if stray_in_gromox[0][1] != existing_new[0][1]:
+                    raise SystemExit(
+                        f"Conflict: {new} in gromox.cfg "
+                        f"({stray_in_gromox[0][1]}) does not match the "
+                        f"one already in {filename} ({existing_new[0][1]})"
+                    )
+                del target[stray_in_gromox[0][0]]
+                migrations.append(
+                    f"gromox.cfg: removed stray {new} (belongs in {filename})"
+                )
+            if matches:
+                remove_indices[filename].add(matches[0][0])
+                migrations.append(f"{filename}: removed stray duplicate {old}")
+            continue
+
+        if matches:
+            # Fresh system: old key still present in its original file.
+            index, value = matches[0]
+        elif stray_in_gromox:
+            # Already (wrongly) migrated to gromox.cfg by an earlier
+            # buggy run - recover the value from there instead.
+            index, value = None, stray_in_gromox[0][1]
+            del target[stray_in_gromox[0][0]]
+            migrations.append(
+                f"gromox.cfg: removed stray {new} (belongs in {filename})"
+            )
+        else:
+            continue
+
+        if index is not None:
+            remove_indices[filename].add(index)
+
+        appended_lines[filename].append(f"{new}={value}\n")
+        migrations.append(f"{filename}: {old} -> {new}={value}")
+
 # Check for deprecated address directives that need manual handling.
 
 address_keys = {
@@ -259,6 +402,14 @@ for filename, indices in remove_indices.items():
         line for index, line in enumerate(contents[filename])
         if index not in indices
     ]
+
+for filename, lines_to_add in appended_lines.items():
+    if not lines_to_add:
+        continue
+    existing = new_contents.setdefault(filename, contents[filename][:])
+    if existing and not existing[-1].endswith("\n"):
+        existing[-1] += "\n"
+    new_contents[filename] = existing + lines_to_add
 
 # Write files atomically, preserving ownership and permissions.
 
@@ -297,7 +448,7 @@ print("CHANGED:", ",".join(written))
 PY
     ); then
         warn "Migration failed. Restoring backup."
-        restore_config "$backup"
+        restore_config "$BACKUP_ROOT"
         die "No migration applied."
     fi
 
@@ -310,23 +461,29 @@ PY
 
     if ! restart_services; then
         warn "A service failed. Rolling back all configuration."
-        restore_config "$backup"
+        restore_config "$BACKUP_ROOT"
         restart_services || true
         die "Migration rolled back."
     fi
 
     log "Migration completed successfully."
-    log "Backup: $backup"
+    print_backup_manifest
 }
 
 revert_config() {
     local backup="${2:-}"
 
     if [[ -z "$backup" ]]; then
-        backup=$(find "$BACKUP_ROOT" -maxdepth 1 \
-            -type d -name 'gromox-modernize.*' \
-            -printf '%T@ %p\n' |
-            sort -nr | head -n1 | cut -d' ' -f2-)
+        # /root/backups/<timestamp>/ is a shared namespace (the same
+        # one server-setup.sh's own backup_file() writes to) - look
+        # specifically for a run that actually backed up gromox.cfg,
+        # not just any timestamped directory.
+        backup=$(find /root/backups -maxdepth 1 -type d -name '[0-9]*' \
+            -printf '%T@ %p\n' 2>/dev/null |
+            sort -nr |
+            while read -r _ dir; do
+                [[ -f "${dir}${DIR}/gromox.cfg" ]] && { echo "$dir"; break; }
+            done)
     fi
 
     [[ -n "$backup" && -d "$backup" ]] ||
