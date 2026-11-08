@@ -1,0 +1,15 @@
+[Unit]
+Description=Run backup-testvps.sh nightly
+
+[Timer]
+# 03:00 local time, same low-traffic window as the apt-repo maintenance.sh
+# backup rotation on the build host - mysqldump --single-transaction does
+# not block writers, so this is not strictly necessary, just considerate.
+OnCalendar=*-*-* 03:00:00
+# If the server was down/rebooting at 03:00, run once shortly after boot
+# instead of silently skipping a whole day.
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

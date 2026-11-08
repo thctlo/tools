@@ -1,0 +1,14 @@
+[Unit]
+Description=Nightly Borg backup of testvps to the remote VPS
+# Soft ordering only: a backup that runs a few minutes late because mariadb
+# was still starting is fine; nothing should ever require this unit.
+After=mariadb.service network-online.target
+Wants=mariadb.service network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/root/tools/backup-testvps.sh
+# A failed backup should be visible in `systemctl --failed` / journal, but
+# must never take down or restart anything else - Type=oneshot with no
+# Restart= already gives that: a failure here only marks this one unit
+# failed.
