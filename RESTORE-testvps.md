@@ -1,29 +1,29 @@
-# Restore-procedure voor testvps (vanuit een backup-testvps.sh/Borg-backup)
+# Restore procedure for testvps (from a backup-testvps.sh/Borg backup)
 
-Dit is géén geautomatiseerd script — bewust, want een restore is een
-beslismoment (welke server, welk archief, wat overschrijf je), niet iets
-om blind te laten draaien. Volg deze stappen in deze volgorde.
+This is deliberately **not** an automated script — a restore is a decision
+point (which server, which archive, what gets overwritten), not something to
+run blind. Follow these steps in this order.
 
-**Voorwaarde:** de nieuwe server heeft al een volledige, succesvolle
-`server-setup.sh`-run gehad (alle pakketten, systeemgebruikers, systemd-units
-bestaan al). Deze restore **overlegt** state daarop, hij vervangt de
-provisioning niet.
+**Prerequisite:** the new server has already had a complete, successful
+`server-setup.sh` run (all packages, system users, systemd units already
+exist). This restore **overlays** state on top of that — it does not replace
+the provisioning.
 
-**Regel 0, altijd: gebruik precies ÉÉN Borg-archief voor de hele restore.**
-Nooit een databasedump van de ene nacht combineren met bestanden van een
-andere — de gebruikers/domeinen in de `grommunio`-database en de
-exmdb-bestanden in `/var/lib/gromox` moeten qua ID's bij elkaar passen.
+**Rule 0, always: use exactly ONE Borg archive for the entire restore.**
+Never combine one night's database dump with another night's files — the
+users/domains in the `grommunio` database and the exmdb files in
+`/var/lib/gromox` must match up by ID.
 
 ```
-borg list "$BORG_REPO"                      # kies het archief
+borg list "$BORG_REPO"                      # pick the archive
 mkdir /root/restore-scratch && cd /root/restore-scratch
-borg extract "$BORG_REPO::<archief-naam>"   # pakt uit in de huidige map
+borg extract "$BORG_REPO::<archive-name>"   # extracts into the current directory
 ```
 
-## Stap 1 — diensten stoppen
+## Step 1 — stop services
 
-Stop alles dat de te herstellen state aanraakt. MariaDB blijft draaien
-(nodig om de dumps in te laden):
+Stop everything that touches the state being restored. Keep MariaDB running
+(needed to load the dumps):
 
 ```
 systemctl stop nginx postfix \
@@ -33,13 +33,13 @@ systemctl stop nginx postfix \
     php8.4-fpm saslauthd rspamd
 ```
 
-## Stap 2 — MySQL-gebruikers/rechten EERST, dan de 3 databases
+## Step 2 — MySQL users/grants FIRST, then the 3 databases
 
-Dit moet in deze volgorde: eerst de accounts (met de oude wachtwoorden),
-dan de data — anders kun je als de app-gebruiker niet eens inloggen om de
-data te zien (en dat is precies niet het punt, je herstelt als root via
-`debian.cnf`, maar de ACCOUNTS moeten alsnog kloppen voor de apps die er
-straks weer mee verbinden).
+This must happen in this order: accounts first (with the old passwords), then
+the data — otherwise the application user can't even log in to see the data
+(which doesn't matter for the restore itself, since you restore as root via
+`debian.cnf`, but the ACCOUNTS still need to be correct for the applications
+that connect again afterward).
 
 ```
 zcat mysql/_users-and-grants.sql.gz | mariadb --defaults-file=/etc/mysql/debian.cnf
@@ -48,42 +48,43 @@ zcat mysql/grofiles.sql.gz           | mariadb --defaults-file=/etc/mysql/debian
 zcat mysql/grommunio_keycloak.sql.gz | mariadb --defaults-file=/etc/mysql/debian.cnf
 ```
 
-(Elke dump bevat zijn eigen `CREATE DATABASE IF NOT EXISTS` + `USE`, dus
-geen losse aanmaak-stap nodig.)
+(Each dump contains its own `CREATE DATABASE IF NOT EXISTS` + `USE`, so no
+separate creation step is needed.)
 
-**Controleer daarna meteen** dat de wachtwoorden in `/etc/dbconfig-common/*.conf`
-en `/etc/grommunio-keycloak/keycloak.conf` (die je in stap 4 terugzet)
-overeenkomen met wat er nu in MySQL staat — dat zou moeten kloppen, want
-beide komen uit hetzelfde archief, maar controleer het (`mariadb -u grofiles
--p<wachtwoord-uit-conf> grofiles -e "SELECT 1;"` enz.) voor je verder gaat.
+**Immediately afterward, verify** that the passwords in
+`/etc/dbconfig-common/*.conf` and `/etc/grommunio-keycloak/keycloak.conf`
+(restored in step 4) match what's now in MySQL — this should already be
+correct, since both come from the same archive, but check it anyway
+(`mariadb -u grofiles -p<password-from-conf> grofiles -e "SELECT 1;"` etc.)
+before continuing.
 
-## Stap 3 — bestanden: gromox, rspamd/DKIM, postfix-queue, cfg-server
+## Step 3 — files: gromox, rspamd/DKIM, postfix queue, cfg-server
 
 ```
 cp -a var/lib/gromox/.       /var/lib/gromox/
 cp -a var/lib/rspamd/.       /var/lib/rspamd/
 cp -a var/spool/postfix/.    /var/spool/postfix/
 cp -a root/cfg-server/.      /root/cfg-server/
-chown -R postfix:postdrop /var/spool/postfix   # cp -a bewaart eigenaar meestal goed, controleer het wel
+chown -R postfix:postdrop /var/spool/postfix   # cp -a usually preserves ownership correctly, but verify
 ```
 
-## Stap 4 — `/etc`: NIET blind alles overschrijven
+## Step 4 — `/etc`: do NOT blindly overwrite everything
 
-De backup bevat de **hele** `/etc` van de oude server — inclusief dingen
-die machine-specifiek zijn en op een nieuwe server anders (en correct!)
-horen te zijn. Sla deze over, tenzij je bewust de identiteit van de oude
-server wilt overnemen (bijv. om SSH "host key changed"-waarschuwingen te
-voorkomen als dezelfde DNS-naam naar deze nieuwe server wijst):
+The backup contains the **entire** `/etc` of the old server — including
+things that are machine-specific and should (correctly!) be different on a
+new server. Skip these unless you deliberately want to take over the old
+server's identity (e.g. to avoid SSH "host key changed" warnings if the same
+DNS name points at this new server):
 
-- `etc/fstab` — schijf-UUID's van de oude server; dit teruggooien kan het
-  mounten op de nieuwe server breken.
+- `etc/fstab` — the old server's disk UUIDs; restoring this can break
+  mounting on the new server.
 - `etc/hostname`, `etc/machine-id`
-- `etc/netplan/`, `etc/network/`, `etc/systemd/network/` — netwerkconfig
-  gebonden aan de oude MAC-adressen/interfacenamen.
-- `etc/ssh/ssh_host_*` — SSH-hostkeys (bewust overnemen is een keuze, geen
-  automatisme).
+- `etc/netplan/`, `etc/network/`, `etc/systemd/network/` — network config
+  tied to the old MAC addresses/interface names.
+- `etc/ssh/ssh_host_*` — SSH host keys (deliberately taking these over is a
+  choice, not something to do automatically).
 
-Zet daarna de rest van `/etc` terug, bijv.:
+Then restore the rest of `/etc`, e.g.:
 
 ```
 rsync -a --exclude='fstab' --exclude='hostname' --exclude='machine-id' \
@@ -92,7 +93,7 @@ rsync -a --exclude='fstab' --exclude='hostname' --exclude='machine-id' \
     etc/ /etc/
 ```
 
-## Stap 5 — diensten herstarten
+## Step 5 — restart services
 
 ```
 systemctl daemon-reload
@@ -102,15 +103,18 @@ systemctl start saslauthd rspamd php8.4-fpm \
     grommunio-admin-api grommunio-keycloak postfix nginx
 ```
 
-(Of simpelweg `reboot` — `60-boot-order.sh` regelt de juiste volgorde al.)
+(Or simply `reboot` — `60-boot-order.sh` already handles the correct order.)
 
-## Stap 6 — controleren
+## Step 6 — verify
 
 - `grommunio-admin-api`: `curl -sk https://localhost:8443/api/v1/status` → database:true
-- Keycloak: inloggen met het wachtwoord uit `/root/cfg-server/keycloak-admin-password.txt`
-- Een testmail versturen/ontvangen, webmail openen, een bestaand bericht/contact zien
-- `fail2ban-client status` — moet weer normaal opstarten (state komt uit `/var/lib/fail2ban`, al herstelt in stap 3 via de volledige `var/lib`-restore)
+- Keycloak: log in with the password from `/root/cfg-server/keycloak-admin-password.txt`
+- Send/receive a test email, open webmail, check an existing message/contact is visible
+- `fail2ban-client status` — should start up normally again (state comes
+  from `/var/lib/fail2ban`, already restored in step 3 via the full
+  `var/lib` restore)
 
-**Nog niet gedaan: dit draaiboek is nog niet echt getest op een wegwerp-VM.**
-Doe dat voor je hierop vertrouwt — deze procedure is zo compleet als ik 'm nu
-kan bedenken, maar "op papier klopt het" is niet hetzelfde als "het werkt".
+**Not done yet: this runbook has not actually been tested on a disposable
+VM yet.** Do that before relying on it — this procedure is as complete as I
+can currently make it on paper, but "correct on paper" is not the same as
+"it works".
