@@ -1,0 +1,5 @@
+# Local, machine-specific - never intentionally edited by hand in this tree
+*.bak
+*.bak.*
+*.tmp
+*~
