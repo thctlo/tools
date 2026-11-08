@@ -72,14 +72,33 @@ restart_services() {
     return "$failed"
 }
 
-# backup_file <absolute path> - ported verbatim from functions/00-common.sh
-# in the server-setup.sh repo (see note above RUN_TIMESTAMP). Not
-# idempotent across repeated touches of the same file WITHIN one run on
-# purpose: the first backup is the true pre-run original; a later touch
-# in the same run appends .1, .2, .3... instead of overwriting it.
+# backup_file <absolute path> / finalize_backup <same path> - ported
+# verbatim from functions/00-common.sh in the server-setup.sh repo (see
+# note above RUN_TIMESTAMP). Not idempotent across repeated touches of
+# the same file WITHIN one run on purpose: the first backup is the true
+# pre-run original; a later touch in the same run appends .1, .2, .3...
+# instead of overwriting it.
+#
+# This tool backs up ALL managed files up front (backup_all_files, before
+# even knowing which ones the migration will actually touch - the Python
+# step below only knows that after inspecting them). finalize_backup
+# (called via finalize_all_files, after the migration has run) removes
+# the backup+manifest line again for any file that turned out byte-
+# identical, so a no-op run (the common case - most config files already
+# have nothing deprecated left to migrate) doesn't leave 5 pointless
+# fresh backups behind every single time this is run.
+# Tracked per-target-path (not a single last-call slot): backup_all_files
+# below backs up several files in a batch before any of them are
+# written, so a single-slot "last backup" variable would only ever let
+# finalize_all_files correctly finalize the LAST file in that batch -
+# found and fixed while testing this against the real batch call
+# pattern here, not a hypothetical.
+declare -A _BACKUP_DEST_FOR
+
 backup_file()
 {
     local target="$1"
+    unset '_BACKUP_DEST_FOR[$target]' 2>/dev/null
     [[ -e "$target" ]] || return 0
     local dest="${BACKUP_ROOT}${target}"
     mkdir -p "$(dirname "$dest")"
@@ -93,6 +112,29 @@ backup_file()
     cp -a "$target" "$dest"
     mkdir -p "$(dirname "$MANIFEST_FILE")"
     printf '%-40s %-50s %s\n' "$(basename "$0")" "$target" "$dest" >> "$MANIFEST_FILE"
+    _BACKUP_DEST_FOR["$target"]="$dest"
+}
+
+finalize_backup()
+{
+    local target="$1"
+    local dest="${_BACKUP_DEST_FOR[$target]:-}"
+    [[ -n "$dest" ]] || return 0
+    [[ -e "$target" && -e "$dest" ]] || return 0
+    if cmp -s "$target" "$dest"; then
+        rm -f "$dest"
+        if [[ -f "$MANIFEST_FILE" ]]; then
+            # grep -v exits 1 (not an error here) when the filtered
+            # result is empty - the "|| true" matters even without an
+            # explicit "&&" after it: under set -e (this whole script
+            # has it), a bare command returning non-zero still aborts
+            # the whole script, found live when this was the only
+            # remaining manifest line.
+            grep -vF "$dest" "$MANIFEST_FILE" > "${MANIFEST_FILE}.tmp" 2>/dev/null || true
+            mv "${MANIFEST_FILE}.tmp" "$MANIFEST_FILE"
+        fi
+    fi
+    unset '_BACKUP_DEST_FOR[$target]'
 }
 
 print_backup_manifest()
@@ -119,6 +161,19 @@ backup_all_files() {
         fi
     done
     log "Backups (if any files existed) written under: $BACKUP_ROOT"
+}
+
+# finalize_all_files: call once after the migration step has finished
+# writing (or not writing) each managed file - see backup_file's comment
+# above for why this exists. Must be called with the SAME $DIR/$file
+# pairing backup_all_files just used, in the same run.
+finalize_all_files() {
+    local file
+    for file in "${FILES[@]}"; do
+        if [[ -f "$DIR/$file" ]]; then
+            finalize_backup "$DIR/$file"
+        fi
+    done
 }
 
 # restore_config <backup-run-directory>
@@ -456,6 +511,7 @@ PY
 
     if [[ "$changed" == *"No deprecated listener directives found."* ]]; then
         log "Nothing to migrate."
+        finalize_all_files
         return
     fi
 
@@ -466,6 +522,7 @@ PY
         die "Migration rolled back."
     fi
 
+    finalize_all_files
     log "Migration completed successfully."
     print_backup_manifest
 }
